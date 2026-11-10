@@ -17,6 +17,15 @@ function randomDeviceName(seed) {
 
 const PING_INTERVAL_MS = 5000;
 const SESSION_TIMEOUT_MS = 12000;
+const MAX_ROOM_PEERS = 20;
+const ROOM_CODE_PATTERN = /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$/;
+
+function normalizeRoomCode(raw) {
+  return String(raw || "")
+    .normalize("NFKC")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+}
 
 export class NetworkRoom {
   constructor(state, env) {
@@ -71,9 +80,21 @@ export class NetworkRoom {
       return new Response("WebSocket連携が必要です", { status: 426 });
     }
 
+    const isCodeRoom = new URL(request.url).searchParams.has("room");
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
+
+    if (isCodeRoom && this.sessions.size >= MAX_ROOM_PEERS) {
+      try {
+        server.send(JSON.stringify({ type: "error", reason: "room-full" }));
+      } catch (err) {}
+      try {
+        server.close(4001, "room-full");
+      } catch (err) {}
+      return new Response(null, { status: 101, webSocket: client });
+    }
 
     const id = crypto.randomUUID();
     const seed = Array.from(id).reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
@@ -206,8 +227,19 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/ws") {
-      const networkId = networkIdFromRequest(request);
-      const objId = env.NETWORK_ROOM.idFromName(networkId);
+      let roomName;
+
+      if (url.searchParams.has("room")) {
+        const code = normalizeRoomCode(url.searchParams.get("room"));
+        if (!ROOM_CODE_PATTERN.test(code)) {
+          return new Response("ルームコードが正しくありません", { status: 400 });
+        }
+        roomName = "room_" + code;
+      } else {
+        roomName = networkIdFromRequest(request);
+      }
+
+      const objId = env.NETWORK_ROOM.idFromName(roomName);
       const stub = env.NETWORK_ROOM.get(objId);
       return stub.fetch(request);
     }
