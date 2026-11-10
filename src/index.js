@@ -18,6 +18,8 @@ function randomDeviceName(seed) {
 const PING_INTERVAL_MS = 5000;
 const SESSION_TIMEOUT_MS = 12000;
 const MAX_ROOM_PEERS = 20;
+const ROOM_GRACE_MS = 5 * 60 * 1000;
+const ROOM_TOKEN_PATTERN = /^[A-Za-z0-9_-]{16,64}$/;
 const ROOM_CODE_PATTERN = /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$/;
 
 function normalizeRoomCode(raw) {
@@ -33,6 +35,46 @@ export class NetworkRoom {
     this.env = env;
     this.sessions = new Map();
     this.sweepTimer = null;
+    this.meta = undefined;
+  }
+
+  async loadMeta() {
+    if (this.meta === undefined) {
+      try {
+        this.meta = (await this.state.storage.get("meta")) || null;
+      } catch (err) {
+        this.meta = null;
+      }
+    }
+    return this.meta;
+  }
+
+  async saveMeta(meta) {
+    this.meta = meta;
+    try {
+      await this.state.storage.put("meta", meta);
+    } catch (err) {}
+  }
+
+  async checkRoomAccess(url) {
+    const mode = url.searchParams.get("mode");
+    const token = url.searchParams.get("token") || "";
+    const meta = await this.loadMeta();
+    const now = Date.now();
+    const active =
+      this.sessions.size > 0 ||
+      (meta !== null && now - meta.lastActive < ROOM_GRACE_MS);
+
+    if (mode === "create") {
+      const owner = meta !== null && meta.token === token;
+      if (active && !owner) return "room-exists";
+      if (!owner) await this.saveMeta({ token, lastActive: now });
+    } else if (!active) {
+      return "room-not-found";
+    }
+
+    if (this.sessions.size >= MAX_ROOM_PEERS) return "room-full";
+    return null;
   }
 
   startSweeper() {
@@ -71,6 +113,9 @@ export class NetworkRoom {
       session.socket.close(code, reason);
     } catch (err) {}
     this.broadcast({ type: "peer-left", id }, id);
+    if (this.sessions.size === 0 && this.meta) {
+      this.saveMeta({ ...this.meta, lastActive: Date.now() });
+    }
     this.stopSweeperIfIdle();
   }
 
@@ -80,18 +125,20 @@ export class NetworkRoom {
       return new Response("WebSocket連携が必要です", { status: 426 });
     }
 
-    const isCodeRoom = new URL(request.url).searchParams.has("room");
+    const url = new URL(request.url);
+    const isCodeRoom = url.searchParams.has("room");
+    const rejection = isCodeRoom ? await this.checkRoomAccess(url) : null;
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
 
-    if (isCodeRoom && this.sessions.size >= MAX_ROOM_PEERS) {
+    if (rejection) {
       try {
-        server.send(JSON.stringify({ type: "error", reason: "room-full" }));
+        server.send(JSON.stringify({ type: "error", reason: rejection }));
       } catch (err) {}
       try {
-        server.close(4001, "room-full");
+        server.close(4001, rejection);
       } catch (err) {}
       return new Response(null, { status: 101, webSocket: client });
     }
@@ -233,6 +280,13 @@ export default {
         const code = normalizeRoomCode(url.searchParams.get("room"));
         if (!ROOM_CODE_PATTERN.test(code)) {
           return new Response("ルームコードが正しくありません", { status: 400 });
+        }
+        const mode = url.searchParams.get("mode");
+        if (mode !== "create" && mode !== "join") {
+          return new Response("ルームの接続方法が正しくありません", { status: 400 });
+        }
+        if (mode === "create" && !ROOM_TOKEN_PATTERN.test(url.searchParams.get("token") || "")) {
+          return new Response("ルームの作成情報が正しくありません", { status: 400 });
         }
         roomName = "room_" + code;
       } else {
